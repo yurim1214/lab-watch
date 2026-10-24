@@ -94,7 +94,7 @@
 <body>
 <header>
   <h1 id="appTitle">증류 수위 알리미</h1>
-  <span id="state" class="pill">카메라 꺼짐</span>
+  <span id="state" class="pill">입력 꺼짐</span>
 </header>
 
 <section id="viewApp" hidden>
@@ -117,19 +117,30 @@
 </section>
 
 <div id="camApp">
+<details open>
+  <summary>알프레드 + 맥북으로 사용하기</summary>
+  <div class="fields">
+    <p class="note">① 실험실 아이폰에서 알프레드 카메라를 켜세요. ② 맥북 Chrome에서 <a href="https://alfred.camera/webapp/viewer/" target="_blank" rel="noopener noreferrer" style="color:var(--watch)">알프레드 웹 뷰어</a>를 열고 실시간 영상을 띄우세요. ③ 아래 ‘알프레드 화면 가져오기’를 눌러 <strong>그 탭만</strong> 선택하세요. 이 알리미 탭을 선택하면 화면이 반복되므로 다시 선택해 주세요.</p>
+    <p class="note">④ 액면이 아직 닿지 않은 목표 높이에 작은 네모를 그리세요. ⑤ 지금 쓰는 아이폰의 ntfy 앱에서 구독한 주제 이름을 설정에 넣고, 테스트 알림을 받은 뒤 감시를 시작하세요. 실시간 시청은 지금 쓰는 아이폰의 알프레드 앱에서 계속할 수 있어요.</p>
+    <p class="note">맥북은 전원 연결 · 덮개 열기 · 잠자기 해제 상태로 두고, 두 페이지를 모두 유지하세요. 맥북의 시스템 설정 → 개인정보 보호 및 보안 → 화면 및 시스템 오디오 녹음에서 Chrome 권한이 필요할 수 있어요. 알프레드 화면 구성과 확대 비율은 감시 중 바꾸지 마세요.</p>
+    <p class="note">기본 감시는 선택 영역의 영상 변화 감지예요. 수위 외에 반사·가림·조명 변화도 알림을 만들 수 있어요. 공유 종료와 입력 갱신 중단은 확인하지만, 알프레드가 같은 정지 영상을 계속 보내는 상황까지 알아내지는 못해요. 맥북이 잠들거나 인터넷이 끊기면 그 순간 폰으로 경고를 보낼 수 없어요.</p>
+  </div>
+</details>
 <section>
   <div id="view">
     <video id="video" playsinline muted autoplay></video>
     <canvas id="overlay"></canvas>
-    <div id="empty">카메라를 켜면 여기에 화면이 나와요.</div>
+    <div id="empty">알프레드 화면을 가져오거나 카메라를 켜 주세요.</div>
   </div>
-  <p class="hint" id="hint">① 카메라를 켜고 ② 화면에서 "여기까지 차면 알림" 위치를 손가락으로 드래그해 네모를 그린 뒤 ③ 감시 시작을 누르세요.</p>
+  <p class="hint" id="hint">① 영상 입력을 연결하고 ② 아직 액체가 없는 목표 높이에 드래그해 네모를 그린 뒤 ③ 감시 시작을 누르세요.</p>
   <div class="row">
-    <button id="btnCam" class="primary">카메라 켜기</button>
+    <button id="btnScreen" class="primary">알프레드 화면 가져오기 (맥북)</button>
+    <button id="btnCam">아이폰 카메라 직접 켜기</button>
     <button id="btnDemo">데모 영상으로 체험</button>
   </div>
   <div class="row">
     <button id="btnWatch" disabled>감시 시작</button>
+    <button id="btnDisconnect" disabled>입력 연결 해제</button>
   </div>
 </section>
 
@@ -176,7 +187,7 @@
     </label>
     <label class="check"><input type="checkbox" id="aiOn"> 알림 전에 AI(Claude)로 한 번 더 확인</label>
     <div id="aiFields" class="fields" style="padding:0">
-      <label>Anthropic API 키 (이 폰에만 저장돼요)
+      <label>Anthropic API 키 (이 브라우저에만 저장돼요)
         <input type="password" id="apiKey" placeholder="sk-ant-..." autocomplete="off">
       </label>
       <label>모델
@@ -199,7 +210,7 @@
 
 <div id="alarm" hidden>
   <div>
-    <h2>수위 도달!</h2>
+    <h2 id="alarmTitle">수위 도달 의심</h2>
     <p id="alarmMsg"></p>
     <button id="btnAck">확인 (알람 끄기)</button>
   </div>
@@ -219,6 +230,9 @@
   const S = {
     liveTimer: null, cmdES: null, lastSnapReq: 0,
     stream: null, demo: null, roi: null, ref: null, watching: false, timer: null,
+    sourceReady: false, selecting: false, sourceType: '', frameCallback: null,
+    lastFrameAt: 0, mutedAt: 0, inputSize: '', watchGeneration: 0,
+    alarmKind: 'level', pendingPush: null, aiController: null,
     hits: 0, history: [], alarmed: false, aiBusy: false, aiPauseUntil: 0,
     audio: null, beepTimer: null, renotifyTimer: null, wake: null, drag: null, lastScore: null,
   };
@@ -301,37 +315,113 @@
   }
   function setState(text, cls = '') { const p = $('state'); p.textContent = text; p.className = 'pill ' + cls; }
 
-  // ---------- 카메라 ----------
+  // ---------- 영상 입력 ----------
+  async function startScreen() {
+    unlockAudio();
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      log('화면 공유는 맥북의 Chrome에서 HTTPS 주소로 열어 사용해 주세요. 아이폰에서는 지원되지 않아요.');
+      return;
+    }
+    S.selecting = true; updateButtons();
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 10, max: 15 } }, audio: false,
+        selfBrowserSurface: 'exclude', surfaceSwitching: 'exclude',
+      });
+      useStream(stream, 'screen');
+      log('선택한 화면을 연결했어요. 알프레드 영상이 맞는지 확인한 뒤 목표 영역을 그려 주세요.');
+    } catch (e) {
+      log(e.name === 'NotAllowedError' ? '공유를 취소했거나 화면 녹화 권한이 없어요. 맥북의 Chrome 권한을 확인해 주세요.' : '화면 공유 실패: ' + e.message);
+    } finally { S.selecting = false; updateButtons(); }
+  }
+
   async function startCamera() {
     unlockAudio();
     if (!navigator.mediaDevices?.getUserMedia) {
       log('이 주소에서는 카메라를 쓸 수 없어요. https:// 주소로 열어야 해요.');
       return;
     }
+    S.selecting = true; updateButtons();
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false,
       });
-      useStream(stream);
+      useStream(stream, 'camera');
       log('카메라를 켰어요.');
     } catch (e) {
       log('카메라를 켜지 못했어요: ' + (e.name === 'NotAllowedError' ? '권한이 거부됐어요. 설정 > Safari > 카메라에서 허용해 주세요.' : e.message));
-    }
+    } finally { S.selecting = false; updateButtons(); }
   }
-  function useStream(stream) {
+  function useStream(stream, sourceType) {
     stopStream();
-    S.stream = stream;
+    S.stream = stream; S.sourceType = sourceType;
+    S.roi = null; S.ref = null; S.drag = null; S.lastScore = null; S.history = [];
+    $('score').textContent = '–'; drawSpark();
+    S.lastFrameAt = performance.now(); S.mutedAt = 0;
+    const track = stream.getVideoTracks()[0];
+    track.onended = () => { if (S.stream === stream) inputFault('영상 공유 또는 카메라 입력이 종료됐어요. 다시 연결해 주세요.'); };
+    track.onmute = () => { if (S.stream === stream) S.mutedAt = performance.now(); };
+    track.onunmute = () => { if (S.stream === stream) S.mutedAt = 0; };
     video.srcObject = stream;
-    video.play().catch(() => {});
+    video.play().catch(() => { if (S.stream === stream) inputFault('영상을 재생하지 못했어요. 입력을 다시 연결해 주세요.'); });
     $('empty').hidden = true;
-    setState('네모를 그리세요', 'busy');
+    setState('영상 준비 중', 'busy');
     updateButtons();
   }
   function stopStream() {
-    if (S.stream) S.stream.getTracks().forEach(t => t.stop());
+    const stream = S.stream; S.stream = null; S.sourceReady = false;
+    if (S.frameCallback !== null && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(S.frameCallback);
+    S.frameCallback = null;
+    if (stream) stream.getTracks().forEach(t => { t.onended = t.onmute = t.onunmute = null; t.stop(); });
     if (S.demo) { cancelAnimationFrame(S.demo.raf); S.demo = null; }
-    S.stream = null;
+    video.srcObject = null;
+    S.roi = null; S.ref = null; S.drag = null;
+    $('empty').hidden = false;
   }
+  video.addEventListener('loadeddata', () => {
+    if (!S.stream || video.srcObject !== S.stream) return;
+    S.sourceReady = true; S.inputSize = `${video.videoWidth}x${video.videoHeight}`;
+    S.lastFrameAt = performance.now();
+    if (video.requestVideoFrameCallback) {
+      const stream = S.stream;
+      const frame = () => {
+        if (S.stream !== stream) return;
+        S.lastFrameAt = performance.now();
+        S.frameCallback = video.requestVideoFrameCallback(frame);
+      };
+      if (S.frameCallback !== null) video.cancelVideoFrameCallback(S.frameCallback);
+      S.frameCallback = video.requestVideoFrameCallback(frame);
+    }
+    setState('네모를 그리세요', 'busy'); updateButtons();
+  });
+  video.addEventListener('resize', () => {
+    if (!S.sourceReady || !S.stream) return;
+    const size = `${video.videoWidth}x${video.videoHeight}`;
+    if (size === S.inputSize) return;
+    S.inputSize = size;
+    if (S.watching) inputFault('공유 영상 크기가 바뀌었어요. 입력을 다시 연결하고 목표 영역을 그려 주세요.');
+    else { S.roi = null; S.ref = null; setState('네모를 다시 그리세요', 'busy'); updateButtons(); }
+  });
+  function inputFault(reason) {
+    const active = S.watching || S.alarmed;
+    if (S.watching) stopWatch('영상 입력을 확인할 때까지 감시를 멈췄어요.');
+    stopStream(); updateButtons();
+    log(reason); setState('입력 확인 필요', 'alarm');
+    if (active) triggerAlarm(reason, 'fault');
+  }
+  setInterval(() => {
+    if (!S.watching || !S.stream || S.alarmed) return;
+    const track = S.stream.getVideoTracks()[0];
+    if (!track || track.readyState !== 'live') return inputFault('영상 입력 연결이 종료됐어요.');
+    if (S.mutedAt && performance.now() - S.mutedAt > 30000) return inputFault('영상 입력이 30초 이상 중단됐어요. 공유 상태를 확인해 주세요.');
+    if (video.requestVideoFrameCallback && performance.now() - S.lastFrameAt > 30000) inputFault('새 영상 프레임이 30초 이상 들어오지 않았어요. 정지 화면인지 확인해 주세요.');
+  }, 2000);
+  window.addEventListener('offline', () => {
+    if (S.watching) inputFault('맥북 인터넷이 끊겼어요. 폰 알림도 전송되지 않을 수 있어요.');
+  });
+  window.addEventListener('online', () => {
+    if (S.alarmed && S.pendingPush) pushNotify(S.pendingPush.message, false, S.pendingPush.kind);
+  });
 
   // 데모: 줄무늬 카드 앞의 플라스크에 액체가 90초 동안 차오르는 가짜 영상
   function startDemo() {
@@ -357,7 +447,7 @@
       S.demo.raf = requestAnimationFrame(draw);
     };
     const stream = c.captureStream(15);
-    useStream(stream);
+    useStream(stream, 'demo');
     S.demo = { raf: requestAnimationFrame(draw) };
     log('데모 영상이에요. 플라스크 위쪽에 네모를 그리고 감시를 시작해 보세요.');
   }
@@ -368,7 +458,7 @@
     return { x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) };
   };
   overlay.addEventListener('pointerdown', e => {
-    if (!S.stream || S.watching) return;
+    if (!S.stream || !S.sourceReady || S.watching || S.alarmed) return;
     overlay.setPointerCapture(e.pointerId);
     S.drag = rel(e); S.roi = null;
   });
@@ -421,6 +511,8 @@
   }
 
   function startWatch() {
+    if (!S.sourceReady || S.alarmed) return;
+    S.watchGeneration++;
     unlockAudio();
     const ref = sampleROI();
     if (!ref) { log('아직 화면이 준비되지 않았어요. 잠시 후 다시 눌러 주세요.'); return; }
@@ -434,15 +526,16 @@
     startLive(); sendStatus('watch');
   }
   function stopWatch(msg = '감시를 멈췄어요.') {
-    S.watching = false; clearInterval(S.timer); S.timer = null; releaseWake();
+    S.watching = false; S.watchGeneration++; S.aiController?.abort();
+    clearInterval(S.timer); S.timer = null; releaseWake();
     clearInterval(S.liveTimer); S.liveTimer = null; sendStatus('idle');
-    setState(S.roi ? '준비됨' : '네모를 그리세요', S.roi ? '' : 'busy');
+    setState(!S.stream ? '입력 꺼짐' : S.roi ? '준비됨' : '네모를 그리세요', S.stream && !S.roi ? 'busy' : '');
     log(msg); updateButtons();
   }
 
   async function tick() {
     if (!S.watching || S.alarmed) return;
-    const cur = sampleROI(); if (!cur) return;
+    const cur = sampleROI(); if (!cur) { inputFault('영상에서 감시 영역을 읽을 수 없어요.'); return; }
     const score = diff(cur, S.ref);
     S.lastScore = score;
     S.history.push(score); if (S.history.length > 90) S.history.shift();
@@ -452,10 +545,12 @@
     if (S.hits < cfg.needHits || S.aiBusy || Date.now() < S.aiPauseUntil) return;
 
     if (cfg.aiOn && cfg.apiKey) {
+      const generation = S.watchGeneration;
       S.aiBusy = true; setState('AI 확인 중', 'busy');
       log(`변화 감지(${score.toFixed(1)}). AI에게 확인을 요청해요.`);
       try {
         const r = await askClaude();
+        if (!S.watching || generation !== S.watchGeneration || S.alarmed) return;
         if (r.verdict === 'NOT_FULL') {
           log('AI: 아직 아니에요. ' + r.reason + ' (1분 뒤 다시 확인)');
           S.hits = 0; S.aiPauseUntil = Date.now() + 60000;
@@ -464,6 +559,7 @@
           triggerAlarm(`AI 판정 ${r.verdict === 'FULL' ? '도달' : '불확실'}: ${r.reason}`);
         }
       } catch (e) {
+        if (!S.watching || generation !== S.watchGeneration || S.alarmed) return;
         log('AI 확인 실패: ' + e.message);
         triggerAlarm('변화량이 기준을 넘었어요 (AI 확인 실패, 직접 확인해 주세요)');
       } finally { S.aiBusy = false; }
@@ -491,35 +587,41 @@
   }
 
   // ---------- 알람 ----------
-  function triggerAlarm(reason) {
-    S.alarmed = true;
-    setState('수위 도달', 'alarm');
+  function triggerAlarm(reason, kind = 'level') {
+    S.alarmed = true; S.alarmKind = kind;
+    const title = kind === 'fault' ? '감시 입력 확인 필요' : '수위 도달 의심';
+    $('alarmTitle').textContent = title;
+    setState(title, 'alarm');
     $('alarmMsg').textContent = reason;
     $('alarm').hidden = false;
     log('알람: ' + reason);
     startBeep();
     if (navigator.vibrate) navigator.vibrate([400, 200, 400]);
-    pushNotify(reason, true);
-    sendStatus('alarm');
+    pushNotify(reason, kind !== 'fault', kind);
+    if (kind !== 'fault') sendStatus('alarm');
     clearInterval(S.renotifyTimer);
-    S.renotifyTimer = setInterval(() => pushNotify('아직 확인하지 않았어요. ' + reason, false), 3 * 60 * 1000);
+    updateButtons();
+    S.renotifyTimer = setInterval(() => pushNotify('아직 확인하지 않았어요. ' + reason, false, kind), 3 * 60 * 1000);
   }
   function ack() {
-    $('alarm').hidden = true; S.alarmed = false; S.hits = 0;
+    $('alarm').hidden = true; S.alarmed = false; S.hits = 0; S.pendingPush = null;
     stopBeep(); clearInterval(S.renotifyTimer);
     stopWatch('알람을 껐어요. 다시 감시하려면 감시 시작을 누르세요.');
   }
 
-  async function pushNotify(message, withPhoto) {
+  async function pushNotify(message, withPhoto, kind = 'level') {
+    const title = kind === 'fault' ? '감시 입력 확인 필요' : '증류 수위 도달 의심';
     if (!cfg.topic) { log('ntfy 주제가 비어 있어서 폰 알림을 보내지 않았어요.'); return; }
     try {
       const res = await fetch('https://ntfy.sh/', {
         method: 'POST',
-        body: JSON.stringify({ topic: cfg.topic, title: '증류 수위 도달', message, priority: 5, tags: ['rotating_light'] }),
+        body: JSON.stringify({ topic: cfg.topic, title, message, priority: 5, tags: ['rotating_light'] }),
+        signal: AbortSignal.timeout(15000),
       });
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      log('폰으로 알림을 보냈어요.');
-    } catch (e) { log('알림 전송 실패: ' + e.message); return; }
+      S.pendingPush = null;
+      log('알림 서버가 메시지를 받았어요. 폰 수신 여부는 직접 확인해 주세요.');
+    } catch (e) { S.pendingPush = { message, kind }; log('알림 전송 실패: ' + e.message + ' (연결 복구 또는 다음 재알림 때 재시도)'); return; }
     if (!withPhoto) return;
     try {
       const blob = await snapshot(0.7, false);
@@ -548,7 +650,7 @@
   function releaseWake() { try { S.wake?.release(); } catch {} S.wake = null; }
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && S.watching) requestWake();
-    if (document.visibilityState === 'hidden' && S.watching) log('화면이 가려졌어요. 이 페이지가 앞에 있어야 감시가 계속돼요.');
+    if (document.visibilityState === 'hidden' && S.watching) log('알리미가 배경으로 이동했어요. 감시 지연을 줄이려면 별도 창으로 열어 화면에 보이게 두세요.');
   });
 
   // ---------- 사진 / AI ----------
@@ -595,7 +697,11 @@ REASON: one short sentence in Korean`;
       'anthropic-dangerous-direct-browser-access': 'true',
     };
     if (cfg.model === 'claude-opus-5-5') { body.fallbacks = 'default'; headers['anthropic-beta'] = 'server-side-fallback-2026-07-01'; }
-    const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers, body: JSON.stringify(body) });
+    S.aiController = new AbortController();
+    const timeout = setTimeout(() => S.aiController?.abort(), 20000);
+    let res;
+    try { res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers, body: JSON.stringify(body), signal: S.aiController.signal }); }
+    finally { clearTimeout(timeout); }
     const json = await res.json().catch(() => ({}));
     if (!res.ok) {
       const m = json?.error?.message || ('HTTP ' + res.status);
@@ -611,13 +717,17 @@ REASON: one short sentence in Korean`;
   // ---------- 버튼 ----------
   function updateButtons() {
     const w = $('btnWatch');
-    w.disabled = !S.stream || !S.roi;
+    w.disabled = !S.stream || !S.sourceReady || !S.roi || S.alarmed;
     w.textContent = S.watching ? '감시 중지' : '감시 시작';
     w.className = S.watching ? 'danger' : (w.disabled ? '' : 'primary');
-    $('btnCam').disabled = S.watching; $('btnDemo').disabled = S.watching;
-    $('btnTestAI').disabled = !S.stream || !S.roi;
+    const locked = S.watching || S.alarmed || S.selecting;
+    $('btnCam').disabled = locked; $('btnDemo').disabled = locked; $('btnScreen').disabled = locked;
+    $('btnDisconnect').disabled = !S.stream || locked;
+    $('btnTestAI').disabled = !S.sourceReady || !S.roi || S.aiBusy || S.watching || S.alarmed;
     $('hint').hidden = S.watching;
   }
+  $('btnScreen').onclick = startScreen;
+  $('btnDisconnect').onclick = () => { stopStream(); setState('입력 꺼짐'); updateButtons(); log('입력 연결을 해제했어요.'); };
   $('btnCam').onclick = startCamera;
   $('btnDemo').onclick = startDemo;
   $('btnWatch').onclick = () => S.watching ? stopWatch() : startWatch();
@@ -639,7 +749,7 @@ REASON: one short sentence in Korean`;
 
   window.__labwatch = S; // 디버깅용
   refreshLabels(); updateButtons(); requestAnimationFrame(drawOverlay); subscribeCmd();
-  log('준비됐어요. 카메라를 켜거나 데모로 체험해 보세요.');
+  log('준비됐어요. 맥북에서 알프레드 화면을 가져오거나 데모로 체험해 보세요.');
 
   // ---------- 원격 보기 화면 (?view=주제이름) ----------
   function startViewer(topic) {
@@ -672,11 +782,12 @@ REASON: one short sentence in Korean`;
       try { if (window.Notification && Notification.permission === 'granted') new Notification(title, { body }); } catch {}
     }
     function alarm(msg) {
+      $('alarmTitle').textContent = '감시 알림 확인';
       $('alarmMsg').textContent = msg;
       if ($('alarm').hidden) {
         $('alarm').hidden = false;
         clearInterval(V.beepTimer); beepOnce(); V.beepTimer = setInterval(beepOnce, 700);
-        notify('증류 수위 도달', msg);
+        notify('증류 감시 알림', msg);
       }
     }
     $('btnAck').onclick = () => {
@@ -687,9 +798,9 @@ REASON: one short sentence in Korean`;
     function render() {
       const L = V.last, now = Date.now() / 1000;
       V.stale = !!(L && L.state === 'watch' && L.hb > 0 && now - L.time > L.hb * 2.5 + 60);
-      if (V.alarmAt && (!L || V.alarmAt >= L.time)) pill('수위 도달', 'alarm');
+      if (V.alarmAt && (!L || V.alarmAt >= L.time)) pill('알림 확인 필요', 'alarm');
       else if (!L) pill(V.connected ? '소식 기다리는 중' : '연결 중', 'busy');
-      else if (L.state === 'alarm') pill('수위 도달', 'alarm');
+      else if (L.state === 'alarm') pill('알림 확인 필요', 'alarm');
       else if (V.stale) pill('감시 폰 응답 없음', 'alarm');
       else if (L.state === 'watch') pill('감시 중', 'watch');
       else pill('감시 꺼짐');
@@ -699,7 +810,7 @@ REASON: one short sentence in Korean`;
       $('vNote').textContent = !L ? '감시 폰이 감시를 시작하면 정해진 간격마다 사진이 와요.'
         : V.stale ? '감시 폰에서 소식이 끊겼어요. 화면이 꺼졌거나 페이지가 닫혔을 수 있어요. 직접 확인해 주세요.'
         : L.state === 'watch' ? (L.hb ? `${Math.round(L.hb / 60)}분마다 사진이 와요.` : '감시 중이에요.')
-        : L.state === 'idle' ? '감시 폰이 감시를 멈춘 상태예요.' : '감시 폰이 수위 도달을 알렸어요.';
+        : L.state === 'idle' ? '감시 폰이 감시를 멈춘 상태예요.' : '감시 기기가 수위 변화를 감지했어요. 직접 확인해 주세요.';
     }
 
     let wasStale = false;
@@ -726,11 +837,11 @@ REASON: one short sentence in Korean`;
         if (!meta || (V.last && V.last.time > m.time)) return;
         V.last = { time: m.time, ...meta };
         if (m.attachment?.url) { $('vImg').src = m.attachment.url; $('vImg').hidden = false; $('vEmpty').hidden = true; }
-        if (meta.state === 'alarm' && live) alarm('감시 폰이 수위 도달을 알렸어요.');
+        if (meta.state === 'alarm' && live) alarm('감시 기기가 수위 변화를 감지했어요. 직접 확인해 주세요.');
       } else if (m.topic === topic && (m.priority || 3) >= 4) {
         V.alarmAt = Math.max(V.alarmAt, m.time);
         vlog('알람: ' + (m.message || ''));
-        if (live) alarm(m.message || '감시 폰이 수위 도달을 알렸어요.');
+        if (live) alarm(m.message || '감시 기기가 수위 변화를 감지했어요. 직접 확인해 주세요.');
       }
       render();
     };
