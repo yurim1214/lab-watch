@@ -69,6 +69,14 @@
   .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .note { font-size: 12px; color: var(--muted); margin: 0; }
 
+  .remote { display: grid; gap: 8px; padding: 10px; border: 1px dashed var(--line); border-radius: 8px; }
+  .remote code { font: 12px var(--mono); color: var(--fg); overflow-wrap: anywhere; user-select: all; }
+
+  #vImgWrap { position: relative; background: #000; border-radius: 10px; overflow: hidden; border: 1px solid var(--line); min-height: 200px; display: grid; place-items: center; }
+  #vImg { display: block; width: 100%; height: auto; }
+  #vEmpty { color: var(--muted); text-align: center; padding: 24px; }
+  .big.warn { color: var(--alarm); }
+
   #log { margin-top: 14px; font: 12px/1.6 var(--mono); color: var(--muted); max-height: 180px; overflow-y: auto; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; }
   #log div { overflow-wrap: anywhere; }
 
@@ -85,10 +93,30 @@
 </head>
 <body>
 <header>
-  <h1>증류 수위 알리미</h1>
+  <h1 id="appTitle">증류 수위 알리미</h1>
   <span id="state" class="pill">카메라 꺼짐</span>
 </header>
 
+<section id="viewApp" hidden>
+  <div id="vImgWrap">
+    <img id="vImg" alt="감시 폰이 보낸 최근 사진" hidden>
+    <div id="vEmpty">감시 폰이 보낸 사진을 기다리는 중이에요.</div>
+  </div>
+  <section class="meter" aria-live="polite">
+    <div class="nums">
+      <div><small>마지막 소식</small><div class="big" id="vAgo">–</div></div>
+      <div style="text-align:right"><small>변화량 / 기준</small><div class="big" id="vScore">–</div></div>
+    </div>
+    <p class="note" id="vNote">감시 폰이 감시를 시작하면 정해진 간격마다 사진이 와요.</p>
+  </section>
+  <div class="row">
+    <button id="vSound" class="primary">알림 소리 켜기</button>
+    <button id="vSnap">지금 사진 요청</button>
+  </div>
+  <p class="hint">이 화면은 보기 전용이에요. 소리를 들으려면 "알림 소리 켜기"를 한 번 눌러 주세요. 감시 폰 소식이 끊기면 경고도 띄워요.</p>
+</section>
+
+<div id="camApp">
 <section>
   <div id="view">
     <video id="video" playsinline muted autoplay></video>
@@ -121,6 +149,20 @@
       <input type="text" id="topic" placeholder="예: yurim-lab-3f9k2" autocomplete="off" autocapitalize="off" spellcheck="false">
     </label>
     <p class="note">주제 이름을 아는 사람은 누구나 알림을 볼 수 있으니 남이 못 맞힐 이름으로 정하세요.</p>
+    <label>다른 기기에서 볼 현황 사진
+      <select id="liveEvery">
+        <option value="0">보내지 않음</option>
+        <option value="120">2분마다</option>
+        <option value="300">5분마다</option>
+        <option value="600">10분마다</option>
+      </select>
+    </label>
+    <div class="remote" id="remoteBox">
+      <span class="note">다른 폰이나 맥에서 이 주소를 열면 원격 보기 화면이 나와요.</span>
+      <code id="remoteUrl"></code>
+      <button id="btnCopy">주소 복사</button>
+    </div>
+    <p class="note">ntfy 무료 한도는 같은 인터넷(와이파이)을 쓰는 기기를 모두 합쳐 하루 250건이에요. 5분마다 보내면 8시간에 약 100건이에요. 사진은 3시간 뒤 자동으로 지워져요.</p>
     <div class="two">
       <label>확인 간격(초)
         <input type="number" id="interval" min="2" max="120" step="1">
@@ -151,6 +193,7 @@
     </div>
   </div>
 </details>
+</div>
 
 <div id="log" aria-label="기록"></div>
 
@@ -168,8 +211,13 @@
   const video = $('video'), overlay = $('overlay'), octx = overlay.getContext('2d');
   const work = document.createElement('canvas'), wctx = work.getContext('2d', { willReadFrequently: true });
 
-  const DEFAULTS = { topic: '', interval: 10, needHits: 3, threshold: 18, aiOn: false, apiKey: '', model: 'claude-opus-5-5' };
+  // ?view=주제이름 으로 열면 원격 보기 화면만 띄움
+  const viewTopic = (new URLSearchParams(location.search).get('view') || '').trim();
+  if (viewTopic) { startViewer(viewTopic); return; }
+
+  const DEFAULTS = { topic: '', interval: 10, needHits: 3, threshold: 18, aiOn: false, apiKey: '', model: 'claude-opus-5-5', liveEvery: 300 };
   const S = {
+    liveTimer: null, cmdES: null, lastSnapReq: 0,
     stream: null, demo: null, roi: null, ref: null, watching: false, timer: null,
     hits: 0, history: [], alarmed: false, aiBusy: false, aiPauseUntil: 0,
     audio: null, beepTimer: null, renotifyTimer: null, wake: null, drag: null, lastScore: null,
@@ -191,13 +239,57 @@
   bind('aiOn', 'aiOn');
   bind('apiKey', 'apiKey', v => v.trim());
   bind('model', 'model');
+  bind('liveEvery', 'liveEvery', Number);
   $('interval').addEventListener('change', () => { if (S.watching) { clearInterval(S.timer); S.timer = setInterval(tick, cfg.interval * 1000); } });
+  $('liveEvery').addEventListener('change', () => { if (S.watching) startLive(); });
+  $('topic').addEventListener('change', subscribeCmd);
 
+  function remoteUrl() { return location.origin + location.pathname + '?view=' + encodeURIComponent(cfg.topic); }
   function refreshLabels() {
     $('thrVal').textContent = cfg.threshold;
     $('thrLabel').textContent = cfg.threshold;
     $('aiFields').hidden = !cfg.aiOn;
+    $('remoteBox').hidden = !cfg.topic;
+    $('remoteUrl').textContent = remoteUrl();
     drawSpark();
+  }
+  $('btnCopy').onclick = async () => {
+    try { await navigator.clipboard.writeText(remoteUrl()); log('원격 보기 주소를 복사했어요.'); }
+    catch { getSelection().selectAllChildren($('remoteUrl')); log('주소를 선택해 두었어요. 직접 복사해 주세요.'); }
+  };
+
+  // ---------- 원격 보기용 현황 사진 ----------
+  async function sendStatus(state) {
+    if (!cfg.topic || !video.videoWidth) return;
+    try {
+      const blob = await snapshot(0.6, true, 640);
+      const meta = { state, score: S.lastScore == null ? null : +S.lastScore.toFixed(1), thr: cfg.threshold, hb: S.watching ? Number(cfg.liveEvery) : 0 };
+      const res = await fetch('https://ntfy.sh/' + encodeURIComponent(cfg.topic + '-live'), {
+        method: 'PUT', body: blob, headers: { 'Filename': 'status.jpg', 'X-Message': JSON.stringify(meta), 'X-Priority': '1' },
+      });
+      if (!res.ok) throw new Error(res.status === 429 ? '오늘 ntfy 한도를 다 썼어요' : 'HTTP ' + res.status);
+    } catch (e) { log('현황 사진 전송 실패: ' + e.message); }
+  }
+  function startLive() {
+    clearInterval(S.liveTimer); S.liveTimer = null;
+    const sec = Number(cfg.liveEvery);
+    if (sec > 0) S.liveTimer = setInterval(() => sendStatus(S.alarmed ? 'alarm' : 'watch'), sec * 1000);
+  }
+  // 다른 기기의 "지금 사진 요청"을 받음
+  function subscribeCmd() {
+    try { S.cmdES?.close(); } catch {}
+    S.cmdES = null;
+    if (!cfg.topic || !window.EventSource) return;
+    S.cmdES = new EventSource('https://ntfy.sh/' + encodeURIComponent(cfg.topic + '-cmd') + '/sse');
+    S.cmdES.onmessage = e => {
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      if (m.event !== 'message' || m.message !== 'snap') return;
+      if (Date.now() - S.lastSnapReq < 20000) return;
+      S.lastSnapReq = Date.now();
+      if (!video.videoWidth) { log('다른 기기에서 사진을 요청했지만 카메라가 꺼져 있어요.'); return; }
+      log('다른 기기에서 사진을 요청해서 보냈어요.');
+      sendStatus(S.alarmed ? 'alarm' : S.watching ? 'watch' : 'idle');
+    };
   }
 
   // ---------- 기록 / 상태 ----------
@@ -339,9 +431,11 @@
     setState('감시 중', 'watch');
     log(`감시를 시작했어요. ${cfg.interval}초마다 확인해요.` + (cfg.topic ? '' : ' (ntfy 주제가 비어 있어서 폰 알림은 안 가요)'));
     updateButtons(); tick();
+    startLive(); sendStatus('watch');
   }
   function stopWatch(msg = '감시를 멈췄어요.') {
     S.watching = false; clearInterval(S.timer); S.timer = null; releaseWake();
+    clearInterval(S.liveTimer); S.liveTimer = null; sendStatus('idle');
     setState(S.roi ? '준비됨' : '네모를 그리세요', S.roi ? '' : 'busy');
     log(msg); updateButtons();
   }
@@ -406,6 +500,7 @@
     startBeep();
     if (navigator.vibrate) navigator.vibrate([400, 200, 400]);
     pushNotify(reason, true);
+    sendStatus('alarm');
     clearInterval(S.renotifyTimer);
     S.renotifyTimer = setInterval(() => pushNotify('아직 확인하지 않았어요. ' + reason, false), 3 * 60 * 1000);
   }
@@ -457,9 +552,9 @@
   });
 
   // ---------- 사진 / AI ----------
-  function snapshot(quality = 0.8, markBox = true) {
+  function snapshot(quality = 0.8, markBox = true, maxW = 1024) {
     const vw = video.videoWidth, vh = video.videoHeight;
-    const scale = Math.min(1, 1024 / vw);
+    const scale = Math.min(1, maxW / vw);
     const c = document.createElement('canvas'); c.width = Math.round(vw * scale); c.height = Math.round(vh * scale);
     const g = c.getContext('2d');
     g.drawImage(video, 0, 0, c.width, c.height);
@@ -543,8 +638,120 @@ REASON: one short sentence in Korean`;
   };
 
   window.__labwatch = S; // 디버깅용
-  refreshLabels(); updateButtons(); requestAnimationFrame(drawOverlay);
+  refreshLabels(); updateButtons(); requestAnimationFrame(drawOverlay); subscribeCmd();
   log('준비됐어요. 카메라를 켜거나 데모로 체험해 보세요.');
+
+  // ---------- 원격 보기 화면 (?view=주제이름) ----------
+  function startViewer(topic) {
+    document.title = '증류 수위 원격 보기';
+    $('appTitle').textContent = '증류 수위 원격 보기';
+    $('camApp').hidden = true; $('viewApp').hidden = false;
+    const enc = encodeURIComponent;
+    const V = { last: null, alarmAt: 0, seen: new Set(), loadedAt: Date.now() / 1000, audio: null, beepTimer: null, stale: false, connected: false };
+
+    const vlog = msg => {
+      const d = document.createElement('div');
+      d.textContent = new Date().toLocaleTimeString('ko-KR', { hour12: false }) + '  ' + msg;
+      $('log').prepend(d);
+      while ($('log').children.length > 200) $('log').lastChild.remove();
+    };
+    const pill = (text, cls = '') => { const p = $('state'); p.textContent = text; p.className = 'pill ' + cls; };
+    const ago = t => {
+      const s = Math.max(0, Math.round(Date.now() / 1000 - t));
+      return s < 60 ? '방금' : s < 3600 ? Math.floor(s / 60) + '분 전' : Math.floor(s / 3600) + '시간 전';
+    };
+
+    function beepOnce() {
+      if (!V.audio) return;
+      const o = V.audio.createOscillator(), g = V.audio.createGain();
+      o.type = 'square'; o.frequency.value = 1760;
+      g.gain.setValueAtTime(0.25, V.audio.currentTime); g.gain.exponentialRampToValueAtTime(0.001, V.audio.currentTime + 0.35);
+      o.connect(g).connect(V.audio.destination); o.start(); o.stop(V.audio.currentTime + 0.35);
+    }
+    function notify(title, body) {
+      try { if (window.Notification && Notification.permission === 'granted') new Notification(title, { body }); } catch {}
+    }
+    function alarm(msg) {
+      $('alarmMsg').textContent = msg;
+      if ($('alarm').hidden) {
+        $('alarm').hidden = false;
+        clearInterval(V.beepTimer); beepOnce(); V.beepTimer = setInterval(beepOnce, 700);
+        notify('증류 수위 도달', msg);
+      }
+    }
+    $('btnAck').onclick = () => {
+      $('alarm').hidden = true; clearInterval(V.beepTimer);
+      vlog('이 기기의 알람을 껐어요. 감시 폰의 알람은 감시 폰에서 꺼야 해요.');
+    };
+
+    function render() {
+      const L = V.last, now = Date.now() / 1000;
+      V.stale = !!(L && L.state === 'watch' && L.hb > 0 && now - L.time > L.hb * 2.5 + 60);
+      if (V.alarmAt && (!L || V.alarmAt >= L.time)) pill('수위 도달', 'alarm');
+      else if (!L) pill(V.connected ? '소식 기다리는 중' : '연결 중', 'busy');
+      else if (L.state === 'alarm') pill('수위 도달', 'alarm');
+      else if (V.stale) pill('감시 폰 응답 없음', 'alarm');
+      else if (L.state === 'watch') pill('감시 중', 'watch');
+      else pill('감시 꺼짐');
+      $('vAgo').textContent = L ? ago(L.time) : '–';
+      $('vAgo').className = 'big' + (V.stale ? ' warn' : '');
+      $('vScore').textContent = L && L.score != null ? `${L.score} / ${L.thr}` : '–';
+      $('vNote').textContent = !L ? '감시 폰이 감시를 시작하면 정해진 간격마다 사진이 와요.'
+        : V.stale ? '감시 폰에서 소식이 끊겼어요. 화면이 꺼졌거나 페이지가 닫혔을 수 있어요. 직접 확인해 주세요.'
+        : L.state === 'watch' ? (L.hb ? `${Math.round(L.hb / 60)}분마다 사진이 와요.` : '감시 중이에요.')
+        : L.state === 'idle' ? '감시 폰이 감시를 멈춘 상태예요.' : '감시 폰이 수위 도달을 알렸어요.';
+    }
+
+    let wasStale = false;
+    setInterval(() => {
+      render();
+      if (V.stale && !wasStale) {
+        vlog('감시 폰에서 소식이 끊겼어요.');
+        beepOnce(); setTimeout(beepOnce, 500);
+        notify('감시 폰 응답 없음', '증류 감시 폰에서 소식이 끊겼어요. 직접 확인해 주세요.');
+      }
+      wasStale = V.stale;
+    }, 15000);
+
+    const es = new EventSource(`https://ntfy.sh/${enc(topic)},${enc(topic + '-live')}/sse?since=3h`);
+    es.addEventListener('open', () => { if (!V.connected) vlog(`"${topic}" 주제에 연결됐어요.`); V.connected = true; render(); });
+    es.onerror = () => { if (V.connected) vlog('연결이 끊겨 다시 연결하는 중이에요.'); V.connected = false; render(); };
+    es.onmessage = e => {
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      if (m.event !== 'message' || V.seen.has(m.id)) return;
+      V.seen.add(m.id);
+      const live = m.time >= V.loadedAt - 5;
+      if (m.topic === topic + '-live') {
+        let meta = null; try { meta = JSON.parse(m.message); } catch {}
+        if (!meta || (V.last && V.last.time > m.time)) return;
+        V.last = { time: m.time, ...meta };
+        if (m.attachment?.url) { $('vImg').src = m.attachment.url; $('vImg').hidden = false; $('vEmpty').hidden = true; }
+        if (meta.state === 'alarm' && live) alarm('감시 폰이 수위 도달을 알렸어요.');
+      } else if (m.topic === topic && (m.priority || 3) >= 4) {
+        V.alarmAt = Math.max(V.alarmAt, m.time);
+        vlog('알람: ' + (m.message || ''));
+        if (live) alarm(m.message || '감시 폰이 수위 도달을 알렸어요.');
+      }
+      render();
+    };
+
+    $('vSound').onclick = async () => {
+      try { V.audio = V.audio || new (window.AudioContext || window.webkitAudioContext)(); await V.audio.resume(); beepOnce(); } catch {}
+      try { if (window.Notification && Notification.permission === 'default') await Notification.requestPermission(); } catch {}
+      $('vSound').textContent = '소리 켜짐'; $('vSound').className = ''; $('vSound').disabled = true;
+      vlog('알림 소리를 켰어요. 이 화면을 열어 두면 알람이 울려요.');
+    };
+    $('vSnap').onclick = async () => {
+      $('vSnap').disabled = true; setTimeout(() => { $('vSnap').disabled = false; }, 20000);
+      try {
+        const res = await fetch('https://ntfy.sh/' + enc(topic + '-cmd'), { method: 'POST', body: 'snap' });
+        vlog(res.ok ? '사진을 요청했어요. 감시 폰이 켜져 있으면 몇 초 안에 와요.' : '요청 실패: HTTP ' + res.status);
+      } catch (err) { vlog('요청 실패: ' + err.message); }
+    };
+
+    render();
+    vlog('원격 보기를 시작했어요.');
+  }
 })();
 </script>
 </body>
